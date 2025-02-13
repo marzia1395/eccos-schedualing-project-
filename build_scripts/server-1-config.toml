@@ -12,5 +12,5 @@ cluster_name = "local-cluster"
 nodes = [1, 2, 3]
 initial_leader = 1
 initial_flexible_quorum = { read_quorum_size = 2, write_quorum_size = 2}
-num_partitions = 1_000
+num_partitions = 10_000
 partition_size = 10

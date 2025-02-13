@@ -12,7 +12,7 @@ use omnipaxos::{util::NodeId, OmniPaxosConfig};
 use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
 use std::{fs::File, io::Write, time::Duration};
 
-const NETWORK_BATCH_SIZE: usize = 100;
+const NETWORK_BATCH_SIZE: usize = 1000;
 const LEADER_WAIT: Duration = Duration::from_secs(2);
 const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -204,13 +204,11 @@ impl OmniPaxosServer {
         }
     }
 
-    fn get_partition(&mut self, key: &Key) -> Result<&mut Partition, &str> {
-        for partition in self.partitions.iter_mut() {
-            if partition.is_responsible(key) {
-                return Ok(partition);
-            }
-        }
-        Err("Did not find a corresponding partition")
+    fn get_partition(&mut self, key: &Key) -> &mut Partition {
+        let idx = key / self.config.partition_size as usize;
+        self.partitions
+            .get_mut(idx)
+            .expect("Should yield a partition")
     }
 
     async fn handle_client_messages(
@@ -231,10 +229,7 @@ impl OmniPaxosServer {
                             | KVCommand::Delete(key) => key,
                         };
 
-                        let partition = match self.get_partition(&key) {
-                            Ok(partition) => partition,
-                            Err(e) => panic!("{}", e),
-                        };
+                        let partition = self.get_partition(&key);
 
                         let command = Command {
                             client_id: from,
@@ -271,9 +266,7 @@ impl OmniPaxosServer {
             match message {
                 ClusterMessage::OmniPaxosMessage((key, msg)) => {
                     let (decided_commands, mut outgoing_msgs) = {
-                        let partition = self
-                            .get_partition(&key)
-                            .expect("Did not find a corresponding partition");
+                        let partition = self.get_partition(&key);
                         partition.handle_incoming(msg);
                         (partition.get_decided_cmds(), partition.get_outgoing_msgs())
                     };

@@ -23,7 +23,7 @@ pub struct ClientConfig {
     pub output_filepath: String,
 }
 
-const NETWORK_BATCH_SIZE: usize = 100;
+const NETWORK_BATCH_SIZE: usize = 1000;
 
 pub struct Client {
     id: ClientId,

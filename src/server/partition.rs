@@ -125,10 +125,6 @@ impl Partition {
         decided_commands
     }
 
-    pub fn is_responsible(&self, key: &Key) -> bool {
-        self.key_range.in_between(key)
-    }
-
     pub fn append_to_log(&mut self, cmd: Command) {
         self.omnipaxos
             .append(cmd)

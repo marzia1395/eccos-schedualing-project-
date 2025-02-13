@@ -90,7 +90,8 @@ pub mod kv {
         }
 
         pub fn in_between(&self, key: &Key) -> bool {
-            self.start_key <= *key && *key <= self.end_key
+            let key = *key;
+            self.start_key <= key && key <= self.end_key
         }
     }
 
