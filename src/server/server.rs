@@ -9,10 +9,14 @@ use chrono::Utc;
 use csv::Writer;
 use log::*;
 use omnipaxos::{util::NodeId, OmniPaxosConfig};
+use omnipaxos_kv::common::kv::Key;
 use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
+use std::collections::{HashMap, VecDeque};
+use std::fs;
+use std::path::Path;
 use std::{fs::File, io::Write, time::Duration};
 
-const NETWORK_BATCH_SIZE: usize = 1000;
+const NETWORK_BATCH_SIZE: usize = 5000;
 const LEADER_WAIT: Duration = Duration::from_secs(2);
 const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -23,12 +27,17 @@ pub struct OmniPaxosServer {
     partitions: Vec<Partition>,
     peers: Vec<NodeId>,
     config: OmniPaxosServerConfig,
+    committed_history: HashMap<Key, VecDeque<usize>>,
+    #[allow(dead_code)]
+    pub num_partitions: u64,
+    #[allow(dead_code)]
+    pub partition_size: u64,
 }
+const WINDOW_SIZE: usize = 5;
 
 impl OmniPaxosServer {
     pub async fn new(config: OmniPaxosServerConfig) -> Self {
         let id = config.server_id;
-
         let database = Database::new();
 
         let network = Network::new(
@@ -40,13 +49,14 @@ impl OmniPaxosServer {
             NETWORK_BATCH_SIZE,
         )
         .await;
-
-        let mut partitions = vec![];
+    
+        // Clone config for OmniPaxosConfig conversion
         let op_config: OmniPaxosConfig = config.clone().into();
 
         let step_size = config.partition_size as usize;
         let num_partitions = config.num_partitions as usize;
 
+        let mut partitions = Vec::with_capacity(num_partitions);
         for i in (0..(num_partitions * step_size)).step_by(step_size) {
             let start_key = i;
             let end_key = i + step_size - 1;
@@ -62,15 +72,17 @@ impl OmniPaxosServer {
 
         let peers = config.get_peers(config.server_id);
 
-        let server = OmniPaxosServer {
+        OmniPaxosServer {
             id,
             database,
             network,
             partitions,
             peers,
+            num_partitions: config.num_partitions,
+            partition_size: config.partition_size,
             config,
-        };
-        server
+            committed_history: HashMap::new(),
+        }
     }
 
     pub async fn run(&mut self) {
@@ -134,12 +146,51 @@ impl OmniPaxosServer {
             }
         }
         info!("Ending Experiment and writing stats");
-        self.save_output().expect("Failed to write to file");
+
+        match self.save_output() {
+            Ok(_) => info!("save_output() completed successfully"),
+            Err(e) => error!("save_output() failed: {}", e),
+        }
     }
 
     fn send_outgoing(&mut self, mut msg_buffer: Vec<(NodeId, ClusterMessage)>) {
         match self.config.out_scheduling_strategy {
             SchedulingStrategy::FCFS => scheduler::fcfs(&mut msg_buffer),
+            SchedulingStrategy::ThroughputPriority => {
+                let mut committed_map = HashMap::new();
+                for partition in &self.partitions {
+                    let key = partition.key_range().start_key();
+                    committed_map.insert(key, partition.count_committed_entries());
+                }
+                scheduler::throughput_priority(
+                    &mut msg_buffer,
+                    &committed_map,
+                    self.config
+                        .initial_flexible_quorum
+                        .unwrap()
+                        .write_quorum_size,
+                );
+            }
+            SchedulingStrategy::Fairness => {
+                let committed_map = self.partition_committed_entries();
+                let window_deltas = self.fairness_window_stats();
+                scheduler::fairness_priority(&mut msg_buffer, &committed_map, &window_deltas);
+            }
+            SchedulingStrategy::TargetedThroughput => {
+                let mut committed_map = HashMap::new();
+                for partition in &self.partitions {
+                    let key = partition.key_range().start_key();
+                    committed_map.insert(key, partition.count_committed_entries());
+                }
+                scheduler::targeted_throughput(
+                    &mut msg_buffer,
+                    &committed_map,
+                    self.config
+                        .initial_flexible_quorum
+                        .unwrap()
+                        .write_quorum_size,
+                );
+            }
         }
 
         for (to, msg) in msg_buffer {
@@ -238,7 +289,7 @@ impl OmniPaxosServer {
                             kv_cmd: kv_command,
                         };
 
-                        partition.append_to_log(command);
+                        partition.append_to_log(command).await;
                         partition.get_outgoing_msgs()
                     };
 
@@ -259,8 +310,42 @@ impl OmniPaxosServer {
 
         match self.config.in_scheduling_strategy {
             SchedulingStrategy::FCFS => scheduler::fcfs(messages),
+            SchedulingStrategy::ThroughputPriority => {
+                let mut committed_map = HashMap::new();
+                for partition in &self.partitions {
+                    let key = partition.key_range().start_key();
+                    committed_map.insert(key, partition.count_committed_entries());
+                }
+                scheduler::throughput_priority(
+                    messages,
+                    &committed_map,
+                    self.config
+                        .initial_flexible_quorum
+                        .unwrap()
+                        .write_quorum_size,
+                );
+            }
+            SchedulingStrategy::Fairness => {
+                let committed_map = self.partition_committed_entries();
+                let window_deltas = self.fairness_window_stats();
+                scheduler::fairness_priority(messages, &committed_map, &window_deltas);
+            }
+            SchedulingStrategy::TargetedThroughput => {
+                let mut committed_map = HashMap::new();
+                for partition in &self.partitions {
+                    let key = partition.key_range().start_key();
+                    committed_map.insert(key, partition.count_committed_entries());
+                }
+                scheduler::targeted_throughput(
+                    messages,
+                    &committed_map,
+                    self.config
+                        .initial_flexible_quorum
+                        .unwrap()
+                        .write_quorum_size,
+                );
+            }
         }
-
         for (_from, message) in messages.drain(..) {
             trace!("{}: Received {message:?}", self.id);
             match message {
@@ -275,13 +360,56 @@ impl OmniPaxosServer {
                     outgoing_msg_buffer.append(&mut outgoing_msgs);
                 }
                 ClusterMessage::LeaderStartSignal(start_time) => {
+                    info!("LeaderStartSignal received! Syncing at {}", start_time);
                     self.send_client_start_signals(start_time)
                 }
-                ClusterMessage::LeaderStopSignal => return true,
+                ClusterMessage::LeaderStopSignal => {
+                    info!("LeaderStopSignal received! Stopping Leader");
+                    return true;
+                }
             }
         }
         self.send_outgoing(outgoing_msg_buffer);
         false
+    }
+
+    fn partition_committed_entries(&self) -> HashMap<Key, usize> {
+        let mut map = HashMap::new();
+        for partition in &self.partitions {
+            let key = partition.key_range().start_key();
+            map.insert(key, partition.count_committed_entries());
+        }
+        map
+    }
+
+    pub fn fairness_window_stats(&mut self) -> HashMap<Key, usize> {
+        let mut deltas: HashMap<Key, usize> = HashMap::new();
+
+        for partition in &mut self.partitions {
+            let key = partition.key_range().start_key();
+            let current_committed = partition.count_committed_entries();
+
+            let history = self
+                .committed_history
+                .entry(key)
+                .or_insert_with(VecDeque::new);
+
+            let delta = if let Some(prev) = history.back() {
+                current_committed.saturating_sub(*prev)
+            } else {
+                0
+            };
+
+            // Maintain window size
+            if history.len() == WINDOW_SIZE {
+                history.pop_front();
+            }
+            history.push_back(current_committed);
+
+            deltas.insert(key, delta);
+        }
+
+        deltas
     }
 
     fn send_cluster_start_signals(&mut self, start_time: Timestamp) {
@@ -301,6 +429,7 @@ impl OmniPaxosServer {
     }
 
     fn save_output(&self) -> Result<(), std::io::Error> {
+        println!("Writing CSV to: {}", self.config.output_filepath);
         self.to_json(self.config.summary_filepath.clone())?;
         self.to_csv(self.config.output_filepath.clone())?;
 
@@ -308,22 +437,36 @@ impl OmniPaxosServer {
     }
 
     fn to_json(&self, file_path: String) -> Result<(), std::io::Error> {
+        if let Some(parent) = Path::new(&file_path).parent() {
+            fs::create_dir_all(parent)?; // Ensure directory exists
+        }
+
         let config_json = serde_json::to_string_pretty(&self.config)?;
-        let mut output_file = File::create(file_path.clone()).unwrap();
+        let mut output_file = File::create(&file_path)?;
         output_file.write_all(config_json.as_bytes())?;
         output_file.flush()
     }
 
     fn to_csv(&self, file_path: String) -> Result<(), std::io::Error> {
-        let file = File::create(file_path)?;
-        let mut writer = Writer::from_writer(file);
-        for partition in self.partitions.iter() {
-            writer.write_record(&[
-                format!("{}", partition.key_range().start_key()),
-                format!("{}", partition.key_range().end_key()),
-                format!("{}", partition.count_committed_entries()),
-            ])?;
+        if let Some(parent) = Path::new(&file_path).parent() {
+            fs::create_dir_all(parent)?; // Ensure directory exists
         }
+
+        let file = File::create(&file_path)?;
+        let mut writer = Writer::from_writer(file);
+
+        let mut total = 0;
+        for partition in self.partitions.iter() {
+            let count = partition.count_committed_entries();
+            writer.write_record(&[
+                &format!("{}", partition.key_range().start_key()),
+                &format!("{}", partition.key_range().end_key()),
+                &format!("{}", count),
+            ])?;
+            total += count;
+        }
+
+        writer.write_record(&["total", "", &format!("{}", total)])?;
         writer.flush()?;
         Ok(())
     }

@@ -7,6 +7,21 @@ pub mod messages {
         utils::Timestamp,
     };
 
+    pub mod ballot_leader_election {
+        use super::NodeId;
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Clone, Copy, Eq, Debug, Default, PartialEq, Hash, Serialize, Deserialize)]
+        pub struct Ballot {
+            pub config_id: u32,
+            pub n: u32,
+            pub priority: u32,
+            pub pid: NodeId,
+        }
+    }
+
+    pub use ballot_leader_election::Ballot;
+
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum RegistrationMessage {
         NodeRegister(NodeId),

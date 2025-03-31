@@ -1,18 +1,31 @@
 #!/bin/bash
 
-client1_id=1
-rust_log="info"
+cd /mnt/c/Users/mihai/eccos/build_scripts
 
-# Clean up child processes
-interrupt() {
-    pkill -P $$
+# Store client PIDs
+PIDS=()
+
+# Define cleanup function on interrupt
+cleanup() {
+  echo "Cleaning up..."
+  for pid in "${PIDS[@]}"; do
+    kill "$pid" 2>/dev/null
+  done
+  wait
+  echo "All clients terminated."
+  exit 0
 }
-trap "interrupt" SIGINT
 
-# Clients' output is saved into bencharking directory
-local_experiment_dir="../benchmarks/logs/local-run"
-mkdir -p "${local_experiment_dir}"
+# Trap SIGINT (Ctrl+C) to trigger cleanup
+trap cleanup SIGINT
 
-# Run clients
-client1_config_path="./client-${client1_id}-config.toml"
-RUST_LOG=$rust_log CONFIG_FILE="$client1_config_path"  cargo run --release --manifest-path="../Cargo.toml" --bin client &
+# Launch all clients in background
+for i in {1..5}; do
+  echo "Starting client-$i..."
+  RUST_LOG=info CONFIG_FILE="./client-${i}-config.toml" \
+  cargo run --release --manifest-path="../Cargo.toml" --bin client &
+  PIDS+=($!)
+done
+
+# Wait for all to complete
+wait
